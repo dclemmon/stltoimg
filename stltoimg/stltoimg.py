@@ -1,27 +1,31 @@
 #!/usr/bin/env python
 
 import argparse
+import io
+import numpy as np
 import os
-import time
 
 from PIL.ImageChops import lighter
 from PIL import Image
-from svglib.svglib import svg2rlg
-from reportlab.graphics import renderPM
+from reportlab.graphics import renderPS
 from reportlab.lib.colors import Color
 from reportlab.graphics.shapes import Group
 from reportlab.graphics.shapes import Polygon
 from reportlab.graphics.shapes import Drawing
+from svglib.svglib import svg2rlg
 
 
 class SVGSmash(object):
-    def __init__(self, path):
+    def __init__(self, path, dpi=72):
         """Populate the SVG object"""
+        self.path = path
+        self.dpi = dpi
+        self.scaleValue = dpi/72.0
         self.target_color = Color(1, 1, 1, 1)
         self.background_color = Color(0, 0, 0, 1)
-        self.path = path
+        self.parentdir = os.path.dirname(path)
         self.drawing = svg2rlg(path)
-        self.image = Image.new('L', size=self.size)
+        self.image = Image.new('RGB', size=self.size)
         self.process(self.drawing)
 
     def process(self, level, color_value=0.0, neighbors=0):
@@ -52,16 +56,18 @@ class SVGSmash(object):
                     gval = float(color_value) / float(neighbors)
                     child.fillColor = Color(gval, gval, gval, 1)
             # Group color correction is complete, convert to image and add to base
-            print 'Processing Layer' + str(int(color_value))
-            print 'Drawing:',
             level.asDrawing(*self.size)
-            print 'Scale:',
-            level.renderScale = 1
-            print 'Render:',
-            img = renderPM.drawToPIL(level, bg=self.background_color)
-            print 'Convert:',
-            img = img.convert('L')
-            print 'Compare'
+            level.renderScale = self.scaleValue
+            ps_str = renderPS.drawToString(
+                level)
+            img = Image.open(io.BytesIO(ps_str))
+            data = np.array(img)
+            r1, g1, b1 = 255, 255, 255
+            r2, g2, b2 = 0, 0, 0
+            red, green, blue = data[:, :, 0], data[:, :, 1], data[:, :, 2]
+            mask = (red == r1) & (green == g1) & (blue == b1)
+            data[:, :, :3][mask] = [r2, g2, b2]
+            img = Image.fromarray(data)
             self.image = lighter(self.image, img)
 
     @property
@@ -77,14 +83,14 @@ class SVGSmash(object):
     @property
     def size(self):
         """Return the size or Bounding Box of the image"""
-        return int(self.drawing.width), int(self.drawing.height)
+        return [int(x * self.scaleValue) for x in [self.drawing.width, self.drawing.height]]
 
 
 def cmd_ars():
     parser = argparse.ArgumentParser()
     # parser.add_argument('-u', '--unit', help='Select the units of the input file e.x. mm or in')
     # parser.add_argument('-a', '--analysis', help='Analyse the input SVG to determine proper layer height')
-    # parser.add_argument('-d', '--dpi', help='Select the output image DPI e.x. 600')
+    parser.add_argument('-d', '--dpi', help='Select the output image DPI e.x. 600')
     # parser.add_argument('-f', '--format', help='The output file format, default png')
     parser.add_argument('model', help='The SVG file to be converted')
     return parser.parse_args()
@@ -93,5 +99,7 @@ def cmd_ars():
 if __name__ == '__main__':
     args = cmd_ars()
     print args
-    svg = SVGSmash(args.model)
-    svg.image.save("{fname}.png".format(fname=svg.input_fname))
+    svg = SVGSmash(args.model, dpi=int(args.dpi))
+    svg.image.save("{path}/{fname}.png".format(path=svg.parentdir,
+                                               fname=svg.input_fname))
+    print svg.input_fname
