@@ -1,105 +1,120 @@
-#!/usr/bin/env python
-
-import argparse
-import io
+import trimesh
 import numpy as np
-import os
+import click
 
-from PIL.ImageChops import lighter
-from PIL import Image
-from reportlab.graphics import renderPS
-from reportlab.lib.colors import Color
-from reportlab.graphics.shapes import Group
-from reportlab.graphics.shapes import Polygon
-from reportlab.graphics.shapes import Drawing
-from svglib.svglib import svg2rlg
+from PIL import Image, ImageChops
 
 
-class SVGSmash(object):
-    def __init__(self, path, dpi=72):
-        """Populate the SVG object"""
-        self.path = path
-        self.dpi = dpi
-        self.scaleValue = dpi/72.0
-        self.target_color = Color(1, 1, 1, 1)
-        self.background_color = Color(0, 0, 0, 1)
-        self.parentdir = os.path.dirname(path)
-        self.drawing = svg2rlg(path)
-        self.image = Image.new('RGB', size=self.size)
-        self.process(self.drawing)
+def load_mesh(filename):
+    """Load a mesh from a file
 
-    def process(self, level, color_value=0.0, neighbors=0):
-        """
-        Process file into output file
-        :param level:
-        :param color_value:
-        :return:
-        """
-        if isinstance(level, Drawing):
-            for child in level.contents:
-                self.process(child,
-                             color_value,
-                             neighbors=len(level.contents))
-        elif isinstance(level, Group) and not any(
-                isinstance(x, Polygon) for x in level.contents):
-            # a group of groups
-            for child in level.contents:
-                color_value += 1
-                self.process(child,
-                             color_value,
-                             neighbors=len(level.contents))
-        elif isinstance(level, Group) and any(
-                isinstance(x, Polygon) for x in level.contents):
-            for child in level.contents:
-                # This should be a polygon
-                if child.fillColor == self.target_color:
-                    gval = float(color_value) / float(neighbors)
-                    child.fillColor = Color(gval, gval, gval, 1)
-            # Group color correction is complete, convert to image and add to base
-            level.asDrawing(*self.size)
-            level.renderScale = self.scaleValue
-            ps_str = renderPS.drawToString(
-                level)
-            img = Image.open(io.BytesIO(ps_str))
-            data = np.array(img)
-            r1, g1, b1 = 255, 255, 255
-            r2, g2, b2 = 0, 0, 0
-            red, green, blue = data[:, :, 0], data[:, :, 1], data[:, :, 2]
-            mask = (red == r1) & (green == g1) & (blue == b1)
-            data[:, :, :3][mask] = [r2, g2, b2]
-            img = Image.fromarray(data)
-            self.image = lighter(self.image, img)
+    Args:
+        filename (str): file name and path for the mesh
 
-    @property
-    def input_fname(self):
-        """Return the input file name"""
-        return os.path.basename(self.path).rsplit('.', 1)[0]
-
-    @property
-    def input_ftype(self):
-        """Return the file extension of the file"""
-        return self.input_fname[-3:]
-
-    @property
-    def size(self):
-        """Return the size or Bounding Box of the image"""
-        return [int(x * self.scaleValue) for x in [self.drawing.width, self.drawing.height]]
+    Returns:
+        mesh: loaded mesh object
+    """
+    mesh = trimesh.load_mesh(filename)
+    return mesh
 
 
-def cmd_ars():
-    parser = argparse.ArgumentParser()
-    # parser.add_argument('-u', '--unit', help='Select the units of the input file e.x. mm or in')
-    # parser.add_argument('-a', '--analysis', help='Analyse the input SVG to determine proper layer height')
-    parser.add_argument('-d', '--dpi', help='Select the output image DPI e.x. 600')
-    # parser.add_argument('-f', '--format', help='The output file format, default png')
-    parser.add_argument('model', help='The SVG file to be converted')
-    return parser.parse_args()
+def slice_mesh(mesh, steps=256, bottom_offset=0, top_offset=0):
+    """Slice a mesh into n steps
+
+    Args:
+        mesh (mesh): mesh object to slice
+        steps (int): number of steps to slice
+        bottom_offset: Floor offset
+        top_offset: Celing offset
+
+    Returns:
+        np.array: array of secitons or slices of the mesh
+    """
+    print("Mesh size:\n" + str(mesh.bounds))
+    z_extents = mesh.bounds[:,2]
+    if (bottom_offset + top_offset) < z_extents.max():
+        z_extents = np.array([z_extents[0] + bottom_offset, z_extents[1] - top_offset])
+    step = (z_extents[1] - z_extents[0]) / steps
+    z_levels = np.arange(*z_extents, step=step)
+
+    # Slice the mesh
+    sections = mesh.section_multiplane(
+        plane_origin=mesh.bounds[0],
+        plane_normal=[0,0,1],
+        heights=z_levels,
+    )
+    # Remove anything that is falsy
+    sections = [x for x in sections if x]
+    return sections
+
+
+def replace_color(img, value, target=255):
+    """Replace a target color/value with another. Useful for removing solid
+       black backgrounds, and replacing them with white
+
+    Args:
+        img (PIL.Image): The image object to replace a color in
+        value (int): the replacement value
+        target (int, optional): The target value. Defaults to 255.
+
+    Returns:
+        PIL.Image: The new, updated Image
+    """
+    im = img.convert("RGBA")
+    data = np.array(im)
+    red, green, blue, alpha = data.T
+    white_areas = (red==target) & (green==target) & (blue==target)
+    data[..., :-1][white_areas.T] = (value, value, value)
+    return Image.fromarray(data)
+
+
+def create_depthmap(mesh, slices):
+    """Create the depthmap from the mesh
+
+    Args:
+        mesh (mesh): The mesh to slice
+        slices (int): The number of slices to create
+
+    Returns:
+        PIL.Image: The Image
+    """
+    mesh.rezero()  # rezero the mesh because the slices are already
+    pitch = mesh.extents[:2].max() / 2048  # Get only the x and y extents
+    origin = mesh.bounds[:,:2][0] - (pitch * 2)
+    span = np.vstack((mesh.bounds[:,:2], origin)).ptp(axis=0)
+    resolution = np.ceil(span /pitch) + 2
+    images = (s.rasterize(resolution=resolution, origin=origin, pitch=pitch) for s in slices)
+    layers = [replace_color(img, i) for i, img in enumerate(images)]
+    depthmap = layers[0]
+    for layer in layers:
+        depthmap = ImageChops.lighter(depthmap, layer)
+    return depthmap
+
+
+@click.command
+@click.option("--bottom-offset", default=0, help="Raise the bottom floor by offset")
+@click.option("--top-offset", default=0, help="Lower the celing by offset")
+@click.option("--steps", default=255, help="Number of steps/values to slice the stl into")
+@click.option("--output", help="Output file name", type=click.Path())
+@click.option("--show", is_flag=True, help="Show the created depthmap")
+@click.option("--replace", type=(int, int), help="Replace a target value with another.")
+@click.argument("mesh")
+def main(bottom_offset, top_offset, steps, output, show, replace, mesh):
+    click.echo("Loading mesh...")
+    stl = load_mesh(mesh)
+    click.echo("Slicing mesh...")
+    slices = slice_mesh(stl, steps=steps, bottom_offset=bottom_offset, top_offset=top_offset)
+    click.echo("Creating DepthMap...")
+    depthmap = create_depthmap(stl, slices)
+    if output is None:
+        output = mesh.split('/')[-1].split('.')[0]
+    if replace:
+        depthmap = replace_color(depthmap, replace[0], replace[1])
+    if show:
+        depthmap.show()
+    else:
+        depthmap.save(f"{output}.png")
 
 
 if __name__ == '__main__':
-    args = cmd_ars()
-    print args
-    svg = SVGSmash(args.model, dpi=int(args.dpi))
-    svg.image.save("{path}/{fname}.png".format(path=svg.parentdir,
-                                               fname=svg.input_fname))
-    print svg.input_fname
+    main()

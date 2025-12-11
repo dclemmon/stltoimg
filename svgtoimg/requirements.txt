@@ -1,8 +1,0 @@
-ghostscript==0.4.1
-lxml==3.8.0
-numpy==1.13.1
-olefile==0.44
-Pillow==4.2.1
-reportlab==3.4.0
-svg2rlg==0.3
-svglib==0.8.1
